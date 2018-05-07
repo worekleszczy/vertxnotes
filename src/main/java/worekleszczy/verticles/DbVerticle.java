@@ -1,7 +1,6 @@
 package worekleszczy.verticles;
 
 import com.google.common.collect.ImmutableMap;
-import com.google.common.primitives.Bytes;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.eventbus.EventBus;
@@ -9,14 +8,10 @@ import io.vertx.core.eventbus.Message;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.mongo.MongoClient;
-import jdk.nashorn.internal.ir.CallNode;
-import org.bson.BsonBinary;
-import org.bson.BsonBinarySubType;
-import org.bson.types.ObjectId;
 
 import java.util.List;
 import java.util.Objects;
-import java.util.UUID;
+import java.util.stream.Collectors;
 
 public class DbVerticle extends AbstractVerticle {
 
@@ -25,16 +20,20 @@ public class DbVerticle extends AbstractVerticle {
   public static final String NOTE_INSERT = "mongo.database.note.insert";
   public static final String NOTE_GET = "mongo.database.note.get";
   public static final String GET_USER_NOTES = "mongo.database.notes.get";
+  public static final String UPDATE_NOTE = "mongo.database.note.update";
+  public static final String DELETE_NOTE = "mongo.database.note.delete";
 
   public static final String SUCCESSFUL = "SUCCESSFUL";
-  public static final String ERROR = "ERROR";
-  public static final String CONFLICT = "CONFLICT";
 
   private MongoClient mongo;
 
   private String dbname = "notes";
   private String usersCollection = "users";
   private String notesCollection = "notes";
+
+  private static final String UNKNOWN_ERROR = "Unknown database error";
+  private static final String NAME_CONFLICT = "Resource with same name exists in system";
+  private static final String NO_RESOURCE = "There is no such resource";
 
   public DbVerticle() {
 
@@ -57,74 +56,78 @@ public class DbVerticle extends AbstractVerticle {
     eventBus.consumer(NOTE_INSERT, this::insertNote);
     eventBus.consumer(NOTE_GET, this::getNote);
     eventBus.consumer(GET_USER_NOTES, this::getUserNotes);
+    eventBus.consumer(UPDATE_NOTE, this::updateNote);
+    eventBus.consumer(DELETE_NOTE, this::deleteNote);
 
     fut.complete();
   }
 
-  private void insertUser(final Message<Object> message) {
-    JsonObject body = (JsonObject) message.body();
+  private void insertUser(final Message<JsonObject> message) {
+    JsonObject body = message.body();
 
-      ifNotExists(usersCollection, new JsonObject().put("username", body.getString("username")),
-        () -> {
-          mongo.insert(usersCollection, body, res -> {
-            JsonObject response = new JsonObject();
-            if (res.succeeded()) {
-              response.put("status", SUCCESSFUL).put("result", res.result());
-              message.reply(response);
-            }
-            else {
-              message.reply(response.put("status", ERROR));
-            }
-          });
-        }, () -> {
-          message.reply(new JsonObject().put("status", CONFLICT));
-        });
+    ifNotExists(usersCollection, new JsonObject().put("username", body.getString("username")),
+      () -> mongo.insert(usersCollection, body, res -> {
+        if (res.succeeded()) {
+          message.reply(res.result());
+        } else {
+          message.fail(500, UNKNOWN_ERROR);
+        }
+      }),
+      () -> message.fail(409, NAME_CONFLICT)
+    );
   }
 
-  private void getUser(final Message<Object> message) {
-      JsonObject query = (JsonObject) message.body();
+  private void getUser(final Message<JsonObject> message) {
+    JsonObject query = message.body();
 
-      mongo.findOne(usersCollection, query, null, response -> {
-        JsonObject resJson = new JsonObject();
-        if (response.succeeded()) {
-          resJson.put("status", SUCCESSFUL)
-            .put("result", response.result());
-          message.reply(resJson);
-        }
-        else {
-          resJson.put("status", ERROR);
-          message.reply(resJson);
-        }
-      });
-  }
-
-  private void insertNote(final Message<Object> message) {
-
-    JsonObject body = (JsonObject) message.body();
-    JsonObject query = new JsonObject().put("name", body.getString("name"));
-
-    ifNotExists(notesCollection, query, () -> {
-      mongo.insert(notesCollection, body, result -> {
-        if(result.succeeded()) {
-          message.reply(result.result());
-        }
-        else
-          result.cause().printStackTrace();
-      });
-    }, () -> {
-      message.reply(new JsonObject().put("Error", "Note already exists"));
+    mongo.findOne(usersCollection, query, null, response -> {
+      if (response.succeeded()) {
+        message.reply(response.result());
+      } else {
+        message.fail(500, UNKNOWN_ERROR);
+      }
     });
+  }
+
+  private void insertNote(final Message<JsonObject> message) {
+
+    JsonObject body = message.body();
+    JsonObject query = new JsonObject()
+      .put("name", body.getString("name"))
+      .put("owner", body.getString("owner"));
+
+    ifNotExists(notesCollection, query,
+      () -> mongo.insert(notesCollection, body, result -> {
+        if (result.succeeded()) {
+          message.reply(result.result());
+        } else
+          message.fail(500, UNKNOWN_ERROR);
+      }),
+      () -> message.fail(409, NAME_CONFLICT)
+    );
   }
 
   private void getUserNotes(final Message<String> message) {
     String userId = message.body();
 
     mongo.find(notesCollection, new JsonObject().put("owner", userId), result -> {
-      if(result.succeeded()) {
+      if (result.succeeded()) {
         List<JsonObject> notes = result.result();
+        notes.stream().map(note -> {
+          Object noteID = note.remove("_id");
+          try {
+            JsonObject objectID = (JsonObject) noteID;
+            note.put("id", objectID.getString("$oid"));
+          } catch (ClassCastException ex) {
+            note.put("id", noteID);
+          } finally {
+            return note;
+          }
+        }).collect(Collectors.toList());
+
         message.reply(new JsonArray(notes));
       } else {
-        message.reply(new JsonObject().put("Error", "Unknown error occurred"));
+        message.fail(500, UNKNOWN_ERROR);
       }
     });
   }
@@ -134,15 +137,51 @@ public class DbVerticle extends AbstractVerticle {
   }
 
 
-    private void getNote(final Message<String> message) {
-    String id = message.body();
+  private void getNote(final Message<String> message) {
+    String noteID = message.body();
 
-    mongo.findOne(notesCollection, new JsonObject().put("_id", id), null, response -> {
+    mongo.findOne(notesCollection, new JsonObject().put("_id", noteID), null, response -> {
       if (response.succeeded()) {
-        message.reply(response.result());
+        if (Objects.isNull(response.result())) {
+          message.fail(404, NO_RESOURCE);
+        } else {
+          message.reply(response.result());
+        }
+      } else {
+        message.fail(500, UNKNOWN_ERROR);
       }
-      else {
-        // logging should happen here
+    });
+  }
+
+  private void updateNote(final Message<JsonObject> message) {
+    JsonObject body = message.body();
+    JsonObject query = body.getJsonObject("query");
+    JsonObject newData = body.getJsonObject("data");
+
+    mongo.findOneAndUpdate(notesCollection, query, new JsonObject().put("$set", newData), result -> {
+      if (result.succeeded() && Objects.nonNull(result.result())) {
+        message.reply(SUCCESSFUL);
+      } else if (result.succeeded() && Objects.isNull(result.result())) {
+        message.fail(404, NO_RESOURCE);
+      } else {
+        result.cause().printStackTrace();
+        message.fail(500, UNKNOWN_ERROR);
+      }
+    });
+  }
+
+  private void deleteNote(final Message<String> message) {
+    String noteID = message.body();
+
+    mongo.removeDocument(notesCollection, new JsonObject().put("_id", noteID), result -> {
+      if (result.succeeded()) {
+        if (result.result().getRemovedCount() >= 1)
+          message.reply(SUCCESSFUL);
+        else {
+          message.fail(404, NO_RESOURCE);
+        }
+      } else {
+        message.fail(500, UNKNOWN_ERROR);
       }
     });
   }
