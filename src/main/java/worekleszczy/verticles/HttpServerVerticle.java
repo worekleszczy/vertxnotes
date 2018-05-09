@@ -11,6 +11,7 @@ import io.vertx.core.json.JsonObject;
 import io.vertx.ext.auth.KeyStoreOptions;
 import io.vertx.ext.auth.jwt.JWTAuth;
 import io.vertx.ext.auth.jwt.JWTAuthOptions;
+import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.BodyHandler;
@@ -44,7 +45,8 @@ public class HttpServerVerticle extends AbstractVerticle {
     }
 
     router = Router.router(this.vertx);
-
+    router.route().handler(this::crossOrigin);
+    router.options().handler(this::optionsCORS);
     router.route().handler(SessionHandler.create(LocalSessionStore.create(this.vertx)))
       .handler(CookieHandler.create());
     router.post().handler(this::appJson);
@@ -169,7 +171,7 @@ public class HttpServerVerticle extends AbstractVerticle {
   }
 
   private void getUserNotes(RoutingContext context) {
-
+    System.out.println("GetUserNotes");
     final String userID = context.user().principal().getString("id");
 
     this.vertx.eventBus().send(DbVerticle.GET_USER_NOTES, userID, result -> {
@@ -230,9 +232,20 @@ public class HttpServerVerticle extends AbstractVerticle {
 
   private void appJson(RoutingContext context) {
     context.response().putHeader("Content-Type", "application/json; charset=UTF-8");
+    System.out.println("Connection");
+    context.next();
+  }
+  private void crossOrigin(RoutingContext context) {
+    context.response().putHeader("Access-Control-Allow-Origin", "*");
     context.next();
   }
 
+  private void optionsCORS(RoutingContext context) {
+    context.response().setStatusCode(200)
+      .putHeader("Access-Control-Allow-Headers","Authorization, Content-Type")
+      .putHeader("Access-Control-Allow-Methods","PATCH, DELETE")
+      .end();
+  }
   private void jsonTypeRequest(RoutingContext context) {
     try {
       context.getBodyAsJson();
